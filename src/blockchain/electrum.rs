@@ -30,7 +30,7 @@ use std::ops::Deref;
 #[allow(unused_imports)]
 use log::{debug, error, info, trace};
 
-use bitcoin::{Transaction, Txid};
+use bitcoin::{BlockHeader, Script, Transaction, Txid};
 
 use electrum_client::{Client, ConfigBuilder, ElectrumApi, Socks5Config};
 
@@ -47,6 +47,69 @@ use crate::{BlockTime, FeeRate};
 pub struct ElectrumBlockchain {
     client: Client,
     stop_gap: usize,
+}
+
+impl IndexedChain for ElectrumBlockchain {
+    fn get_header(&self, height: u32) -> Result<BlockHeader, Error> {
+        Ok(self.client.block_header(height as usize)?)
+    }
+
+    fn get_position_in_block(&self, txid: &Txid, height: usize) -> Result<Option<usize>, Error> {
+        Ok(Some(self.client.transaction_get_merkle(txid, height)?.pos))
+    }
+
+    // TODO: This isn't great and I'm not even sure it works correctly
+    //       it requires support for fetching `verbose` tx from electrum
+    //       so that we can check for confirmations / confirmation height
+    fn get_tx_status(&self, txid: &Txid) -> Result<Option<TxStatus>, Error> {
+        match self.client.transaction_get(txid) {
+            Ok(_tx) => Ok(Some(TxStatus {
+                confirmed: true,
+                block_height: None,
+            })),
+            Err(e) => match e {
+                electrum_client::Error::Protocol(serde_json::Value::String(str))
+                    if str.eq("missing transaction") =>
+                {
+                    Ok(None)
+                }
+                _ => Err(Error::Electrum(e)),
+            },
+        }
+    }
+
+    fn get_script_tx_history(
+        &self,
+        script: &Script,
+    ) -> Result<Vec<(TxStatus, Transaction)>, Error> {
+        let histories = self.client.script_get_history(script)?;
+
+        let res: Result<Vec<(TxStatus, Transaction)>, Error> = histories
+            .iter()
+            .map(|history| {
+                let status = {
+                    if history.height <= 0 {
+                        TxStatus {
+                            confirmed: false,
+                            block_height: None,
+                        }
+                    } else {
+                        TxStatus {
+                            confirmed: true,
+                            block_height: Some(history.height as u32),
+                        }
+                    }
+                };
+
+                match self.client.transaction_get(&history.tx_hash) {
+                    Ok(tx) => Ok((status, tx)),
+                    Err(e) => Err(Error::Electrum(e)),
+                }
+            })
+            .collect();
+
+        res
+    }
 }
 
 impl std::convert::From<Client> for ElectrumBlockchain {
