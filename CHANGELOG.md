@@ -101,6 +101,7 @@ To decouple the `Wallet` from the `Blockchain` we've made major changes:
 - Add new method on the `TxBuilder` to embed data in the transaction via `OP_RETURN`. To allow that a fix to check the dust only on spendable output has been introduced.
 - Update the `Database` trait to store the last sync timestamp and block height
 - Rename `ConfirmationTime` to `BlockTime`
+- Introduce `IndexedChain` trait and implement it for Electrum and Esplora blockchains.
 
 ## [v0.13.0] - [v0.12.0]
 

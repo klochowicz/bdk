@@ -22,6 +22,9 @@ use log::{debug, error, info, trace};
 use esplora_client::{convert_fee_rate, AsyncClient, Builder, Tx};
 use futures::stream::{FuturesOrdered, TryStreamExt};
 
+use super::api::{MerkleProof, Tx, TxStatus};
+use crate::blockchain::esplora::EsploraError;
+use crate::blockchain::TxStatus as BdkTxStatus;
 use crate::blockchain::*;
 use crate::database::BatchDatabase;
 use crate::error::Error;
@@ -71,6 +74,34 @@ impl EsploraBlockchain {
     pub fn with_concurrency(mut self, concurrency: u8) -> Self {
         self.concurrency = concurrency;
         self
+    }
+}
+
+#[maybe_async]
+impl IndexedChain for EsploraBlockchain {
+    fn get_header(&self, height: u32) -> Result<BlockHeader, Error> {
+        Ok(await_or_block!(self.url_client._get_header(height))?)
+    }
+
+    fn get_position_in_block(&self, txid: &Txid, _height: usize) -> Result<Option<usize>, Error> {
+        let merkle_proof = await_or_block!(self.url_client._get_merkle_proof(txid))?;
+        Ok(merkle_proof.map(|mp| mp.pos as usize))
+    }
+
+    fn get_tx_status(&self, txid: &Txid) -> Result<Option<BdkTxStatus>, Error> {
+        Ok(await_or_block!(self.url_client._get_tx_with_status(txid))?.map(|tx| tx.status.into()))
+    }
+
+    fn get_script_tx_history(
+        &self,
+        script: &Script,
+    ) -> Result<Vec<(BdkTxStatus, Transaction)>, Error> {
+        Ok(
+            await_or_block!(self.url_client._scripthash_txs(script, None))?
+                .into_iter()
+                .map(|tx| (tx.status.clone().into(), tx.to_tx()))
+                .collect(),
+        )
     }
 }
 
@@ -221,6 +252,152 @@ impl WalletSync for EsploraBlockchain {
 
         database.commit_batch(batch_update)?;
         Ok(())
+    }
+}
+
+impl UrlClient {
+    async fn _get_tx(&self, txid: &Txid) -> Result<Option<Transaction>, EsploraError> {
+        let resp = self
+            .client
+            .get(&format!("{}/tx/{}/raw", self.url, txid))
+            .send()
+            .await?;
+
+        if let StatusCode::NOT_FOUND = resp.status() {
+            return Ok(None);
+        }
+
+        Ok(Some(deserialize(&resp.error_for_status()?.bytes().await?)?))
+    }
+
+    async fn _get_tx_no_opt(&self, txid: &Txid) -> Result<Transaction, EsploraError> {
+        match self._get_tx(txid).await {
+            Ok(Some(tx)) => Ok(tx),
+            Ok(None) => Err(EsploraError::TransactionNotFound(*txid)),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn _get_tx_with_status(&self, txid: &Txid) -> Result<Option<Tx>, EsploraError> {
+        let resp = self
+            .client
+            .get(&format!("{}/tx/{}", self.url, txid))
+            .send()
+            .await?;
+
+        if let StatusCode::NOT_FOUND = resp.status() {
+            return Ok(None);
+        }
+
+        Ok(Some(resp.error_for_status()?.json().await?))
+    }
+
+    async fn _get_tx_status(&self, txid: &Txid) -> Result<Option<TxStatus>, EsploraError> {
+        let resp = self
+            .client
+            .get(&format!("{}/tx/{}/status", self.url, txid))
+            .send()
+            .await?;
+
+        if let StatusCode::NOT_FOUND = resp.status() {
+            return Ok(None);
+        }
+
+        Ok(Some(resp.error_for_status()?.json().await?))
+    }
+
+    async fn _get_merkle_proof(&self, txid: &Txid) -> Result<Option<MerkleProof>, EsploraError> {
+        let resp = self
+            .client
+            .get(&format!("{}/tx/{}/merkle-proof", self.url, txid))
+            .send()
+            .await?;
+
+        if let StatusCode::NOT_FOUND = resp.status() {
+            return Ok(None);
+        }
+
+        Ok(Some(resp.error_for_status()?.json().await?))
+    }
+
+    async fn _get_header(&self, block_height: u32) -> Result<BlockHeader, EsploraError> {
+        let resp = self
+            .client
+            .get(&format!("{}/block-height/{}", self.url, block_height))
+            .send()
+            .await?;
+
+        if let StatusCode::NOT_FOUND = resp.status() {
+            return Err(EsploraError::HeaderHeightNotFound(block_height));
+        }
+        let bytes = resp.bytes().await?;
+        let hash = std::str::from_utf8(&bytes)
+            .map_err(|_| EsploraError::HeaderHeightNotFound(block_height))?;
+
+        let resp = self
+            .client
+            .get(&format!("{}/block/{}/header", self.url, hash))
+            .send()
+            .await?;
+
+        let header = deserialize(&Vec::from_hex(&resp.text().await?)?)?;
+
+        Ok(header)
+    }
+
+    async fn _broadcast(&self, transaction: &Transaction) -> Result<(), EsploraError> {
+        self.client
+            .post(&format!("{}/tx", self.url))
+            .body(serialize(transaction).to_hex())
+            .send()
+            .await?
+            .error_for_status()?;
+
+        Ok(())
+    }
+
+    async fn _get_height(&self) -> Result<u32, EsploraError> {
+        let req = self
+            .client
+            .get(&format!("{}/blocks/tip/height", self.url))
+            .send()
+            .await?;
+
+        Ok(req.error_for_status()?.text().await?.parse()?)
+    }
+
+    async fn _scripthash_txs(
+        &self,
+        script: &Script,
+        last_seen: Option<Txid>,
+    ) -> Result<Vec<Tx>, EsploraError> {
+        let script_hash = sha256::Hash::hash(script.as_bytes()).into_inner().to_hex();
+        let url = match last_seen {
+            Some(last_seen) => format!(
+                "{}/scripthash/{}/txs/chain/{}",
+                self.url, script_hash, last_seen
+            ),
+            None => format!("{}/scripthash/{}/txs", self.url, script_hash),
+        };
+        Ok(self
+            .client
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Vec<Tx>>()
+            .await?)
+    }
+
+    async fn _get_fee_estimates(&self) -> Result<HashMap<String, f64>, EsploraError> {
+        Ok(self
+            .client
+            .get(&format!("{}/fee-estimates", self.url,))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<HashMap<String, f64>>()
+            .await?)
     }
 }
 

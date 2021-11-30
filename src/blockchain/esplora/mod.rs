@@ -32,6 +32,18 @@ mod blocking;
 #[cfg(feature = "use-esplora-blocking")]
 pub use self::blocking::*;
 
+use crate::blockchain::TxStatus as BdkTxStatus;
+use api::TxStatus;
+
+impl From<TxStatus> for BdkTxStatus {
+    fn from(status: TxStatus) -> Self {
+        Self {
+            confirmed: status.confirmed,
+            block_height: status.block_height,
+        }
+    }
+}
+
 /// Configuration for an [`EsploraBlockchain`]
 #[derive(Debug, serde::Deserialize, serde::Serialize, Clone, PartialEq, Eq)]
 pub struct EsploraBlockchainConfig {
