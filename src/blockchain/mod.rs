@@ -21,7 +21,7 @@ use std::ops::Deref;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
-use bitcoin::{BlockHeader, Script, Transaction, Txid};
+use bitcoin::{BlockHash, BlockHeader, Script, Transaction, Txid};
 
 use crate::database::BatchDatabase;
 use crate::error::Error;
